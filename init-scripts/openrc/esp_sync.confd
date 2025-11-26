@@ -1,0 +1,4 @@
+# /etc/conf.d/esp_sync
+#
+ESP_SOURCE="/efi"
+ESP_DEST="/efi2"
