@@ -2,3 +2,4 @@
 #
 ESP_SOURCE="/efi"
 ESP_DEST="/efi2"
+ESP_EXTRAARGS="--ignore EFI/refind/vars"

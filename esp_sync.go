@@ -10,7 +10,6 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 
@@ -49,7 +48,6 @@ var (
 	dryRun      bool
 	ignoredDirs stringArray
 	watcher     *fsnotify.Watcher
-	wg          sync.WaitGroup // Waits for active sync operations on shutdown
 )
 
 // --- Logging Helper ---
@@ -123,7 +121,6 @@ func areFilesIdenticalRobust(srcPath, destPath string) bool {
 	}
 
 	// 2. Robust Check: Content Hash
-	// Since size matches, we must verify content to be sure.
 	srcHash, err := calculateMD5(srcPath)
 	if err != nil {
 		return false // Assume different on error
@@ -145,7 +142,6 @@ func retryOperation(desc string, op func() error) error {
 		if err = op(); err == nil {
 			return nil
 		}
-		// If dry run, we might get "nil" errors effectively, but logic handles dryRun inside op usually.
 		if dryRun {
 			return nil
 		}
@@ -158,7 +154,6 @@ func retryOperation(desc string, op func() error) error {
 }
 
 // copyFileAtomic copies content to a temp file then renames it to overwrite the target.
-// This ensures the destination file is never in a partial/corrupted state.
 func copyFileAtomic(src, dst string) error {
 	in, err := os.Open(src)
 	if err != nil {
@@ -230,12 +225,22 @@ func performSyncAction(srcPath string) {
 
 	// CASE A: Source Does Not Exist -> Delete Destination
 	if os.IsNotExist(err) {
-		// Only remove if it exists
-		if _, err := os.Stat(destPath); !os.IsNotExist(err) {
+		// Check for the file OR a leftover temp file
+		_, dstErr := os.Stat(destPath)
+		_, tmpErr := os.Stat(destPath + ".tmp")
+		
+		exists := !os.IsNotExist(dstErr) || !os.IsNotExist(tmpErr)
+
+		if exists {
 			dryRunLog("Deleting: %s", destPath)
 			if !dryRun {
 				err := retryOperation("remove "+destPath, func() error {
-					return os.RemoveAll(destPath)
+					// Remove main file
+					e1 := os.RemoveAll(destPath)
+					// Clean up potential temp file from interrupted atomic copy
+					e2 := os.RemoveAll(destPath + ".tmp")
+					if e1 != nil { return e1 }
+					return e2
 				})
 				if err != nil {
 					log.Printf("Error removing %s: %v", destPath, err)
@@ -249,7 +254,6 @@ func performSyncAction(srcPath string) {
 	if srcInfo.IsDir() {
 		// Check if directory already exists to avoid verbose logging
 		if stat, err := os.Stat(destPath); err == nil && stat.IsDir() {
-			// Directory exists. Ensure watcher is active on source (idempotent), but don't log.
 			if !dryRun && watcher != nil {
 				addWatcherRecursively(watcher, srcPath)
 			}
@@ -264,8 +268,6 @@ func performSyncAction(srcPath string) {
 			if err != nil {
 				log.Printf("Error creating directory %s: %v", destPath, err)
 			}
-			
-			// Add to watcher (idempotent usually, but good to ensure)
 			if watcher != nil {
 				addWatcherRecursively(watcher, srcPath)
 			}
@@ -274,12 +276,10 @@ func performSyncAction(srcPath string) {
 	}
 
 	// CASE C: Source is File -> Copy Atomic
-	// Check if update is needed
 	if areFilesIdenticalRobust(srcPath, destPath) {
 		return // Skip
 	}
 
-	// Determine specific action verb
 	action := "Updating File"
 	if _, err := os.Stat(destPath); os.IsNotExist(err) {
 		action = "Creating File"
@@ -326,14 +326,12 @@ func initialSync(source, destination string) {
 		relPath, _ := filepath.Rel(destination, path)
 		sourcePath := filepath.Join(source, relPath)
 
-		// If ignored, do not touch (safety)
 		if isPathIgnored(sourcePath) {
 			if info.IsDir() { return filepath.SkipDir }
 			return nil
 		}
 
 		if _, err := os.Stat(sourcePath); os.IsNotExist(err) {
-			// Source missing, perform action (which handles deletion)
 			performSyncAction(sourcePath) 
 			if info.IsDir() { return filepath.SkipDir }
 		}
@@ -376,7 +374,8 @@ func isMountPoint(path string) (bool, error) {
 }
 
 func main() {
-	log.SetFlags(0) // Clean logs
+	log.SetFlags(0)
+	log.SetOutput(os.Stdout) // Force logs to write to stdout instead of stderr
 
 	flag.StringVar(&SOURCE_DIR, "source", "/tmp/efi_source", "Source directory")
 	flag.StringVar(&DEST_DIR, "dest", "/tmp/efi_dest", "Destination directory")
@@ -387,12 +386,10 @@ func main() {
 	SOURCE_DIR = filepath.Clean(SOURCE_DIR)
 	DEST_DIR = filepath.Clean(DEST_DIR)
 	
-	// Prepare ignored dirs
 	for i, dir := range ignoredDirs {
 		ignoredDirs[i] = filepath.Clean(filepath.Join(SOURCE_DIR, dir))
 	}
 
-	// Validate Mounts
 	log.Println("Validating mount points...")
 	if ok, _ := isMountPoint(SOURCE_DIR); !ok {
 		log.Fatalf("FATAL: Source %s is not a mount point.", SOURCE_DIR)
@@ -402,10 +399,8 @@ func main() {
 	}
 	log.Println("Validation successful.")
 
-	// Initial Sync
 	initialSync(SOURCE_DIR, DEST_DIR)
 
-	// Watcher Setup
 	var err error
 	watcher, err = fsnotify.NewWatcher()
 	if err != nil {
@@ -419,32 +414,22 @@ func main() {
 
 	log.Printf("Service started. Watching %s...", SOURCE_DIR)
 
-	// --- Debounce & Signal Handling Loop ---
-	
-	// Map to store pending events: path -> executionTime
 	pendingEvents := make(map[string]time.Time)
-	// Ticker to check pending events
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
-	// Channel for OS signals (Graceful Shutdown)
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
 	done := false
 	for !done {
 		select {
-		// 1. Handle New File Events
 		case event, ok := <-watcher.Events:
 			if !ok {
 				done = true
 				break
 			}
-			// We only care that *something* happened at this path.
-			// We rely on performSyncAction to check the actual state (Exist/NotExist) later.
-			// This inherently coalesces Create/Write/Chmod into a single action.
 			pendingEvents[event.Name] = time.Now().Add(debounceInterval)
 
-		// 2. Handle Watcher Errors
 		case err, ok := <-watcher.Errors:
 			if !ok {
 				done = true
@@ -452,31 +437,26 @@ func main() {
 			}
 			log.Println("Watcher error:", err)
 
-		// 3. Process Debounced Events
 		case <-ticker.C:
 			now := time.Now()
 			for path, execTime := range pendingEvents {
 				if now.After(execTime) {
-					// Time to sync!
 					delete(pendingEvents, path)
 					
-					wg.Add(1)
-					go func(p string) {
-						defer wg.Done()
-						performSyncAction(p)
-					}(path)
+					// IMPORTANT CHANGE: Run synchronously to avoid race conditions 
+					// between creating/copying a file and immediately deleting it.
+					// On slow USB media, atomic copy+flush+rename can be slow.
+					// Running synchronously ensures the file exists before we check if it needs deletion.
+					performSyncAction(path)
 				}
 			}
 
-		// 4. Graceful Shutdown
 		case <-sigChan:
 			log.Println("\nReceived termination signal. Stopping watcher...")
 			done = true
 		}
 	}
 
-	log.Println("Waiting for pending operations to finish...")
-	wg.Wait()
 	log.Println("Shutdown complete.")
 }
 

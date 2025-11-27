@@ -5,7 +5,7 @@
 name="esp_sync daemon"
 description="Tries to keep two directories in sync, useful for UEFI ESP"
 command=/usr/bin/esp_sync
-command_args="--source ${ESP_SOURCE} --dest ${ESP_DEST}"
+command_args="--source ${ESP_SOURCE} --dest ${ESP_DEST} ${ESP_EXTRAARGS}"
 
 PIDFILE=/run/esp_sync.pid
 
