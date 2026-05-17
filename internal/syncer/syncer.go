@@ -9,7 +9,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
-	"log/slog"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -42,8 +42,8 @@ type Config struct {
 	DebounceInterval time.Duration
 	// MaxRetries controls retry attempts for filesystem mutations.
 	MaxRetries int
-	// Logger receives structured daemon logs.
-	Logger *slog.Logger
+	// Logger receives daemon logs.
+	Logger *log.Logger
 }
 
 // Syncer mirrors one authoritative source directory into one destination.
@@ -52,7 +52,7 @@ type Syncer struct {
 	sourceDir    string
 	destDir      string
 	ignoredPaths []string
-	logger       *slog.Logger
+	logger       *log.Logger
 	watcher      *fsnotify.Watcher
 }
 
@@ -74,7 +74,7 @@ func New(cfg Config) (*Syncer, error) {
 		cfg.MaxRetries = defaultMaxRetries
 	}
 	if cfg.Logger == nil {
-		cfg.Logger = slog.Default()
+		cfg.Logger = log.Default()
 	}
 
 	ignoredPaths := make([]string, 0, len(cfg.IgnoredPaths))
@@ -125,11 +125,11 @@ func (s *Syncer) Run(ctx context.Context) error {
 		return fmt.Errorf("watch source tree: %w", err)
 	}
 
-	s.logger.Info("Service started", "source", s.sourceDir)
+	s.logger.Printf("Service started. Watching %s...", s.sourceDir)
 	if s.cfg.ResyncInterval > 0 {
-		s.logger.Info("Periodic reconciliation enabled", "interval", s.cfg.ResyncInterval)
+		s.logger.Printf("Periodic reconciliation enabled every %s.", s.cfg.ResyncInterval)
 	} else {
-		s.logger.Info("Periodic reconciliation disabled")
+		s.logger.Printf("Periodic reconciliation disabled.")
 	}
 
 	pendingEvents := make(map[string]fsnotify.Event)
@@ -148,7 +148,7 @@ func (s *Syncer) Run(ctx context.Context) error {
 	for {
 		select {
 		case <-ctx.Done():
-			s.logger.Info("Shutdown requested")
+			s.logger.Printf("Shutdown requested.")
 			return nil
 
 		case event, ok := <-watcher.Events:
@@ -165,7 +165,7 @@ func (s *Syncer) Run(ctx context.Context) error {
 			if !ok {
 				return nil
 			}
-			s.logger.Warn("Watcher error", "error", err)
+			s.logger.Printf("Warning: Watcher error: %v", err)
 
 		case <-eventTicker.C:
 			now := time.Now()
@@ -202,7 +202,7 @@ func (s *Syncer) ValidateSyncRoots() error {
 
 // Reconcile mirrors the full source tree into the destination.
 func (s *Syncer) Reconcile(ctx context.Context) error {
-	s.logger.Info("Starting mirror reconciliation", "source", s.sourceDir, "destination", s.destDir)
+	s.logger.Printf("Starting mirror reconciliation from %s to %s...", s.sourceDir, s.destDir)
 
 	if !s.cfg.DryRun {
 		if err := os.MkdirAll(s.destDir, 0755); err != nil {
@@ -217,7 +217,7 @@ func (s *Syncer) Reconcile(ctx context.Context) error {
 		return err
 	}
 
-	s.logger.Info("Mirror reconciliation complete")
+	s.logger.Printf("Mirror reconciliation complete.")
 	return nil
 }
 
@@ -330,7 +330,7 @@ func (s *Syncer) performSyncAction(ctx context.Context, srcPath string) error {
 func (s *Syncer) deleteDestinationPath(ctx context.Context, destPath string) error {
 	_, err := os.Stat(destPath)
 	if err == nil {
-		s.logAction("delete", "path", destPath)
+		s.logAction("Deleting: %s", destPath)
 		if !s.cfg.DryRun {
 			if err := s.retryOperation(ctx, "remove "+destPath, func() error {
 				return os.RemoveAll(destPath)
@@ -359,7 +359,7 @@ func (s *Syncer) ensureDestinationDirectory(ctx context.Context, srcPath, destPa
 		return nil
 	}
 
-	s.logAction("create directory", "path", destPath)
+	s.logAction("Creating Directory: %s", destPath)
 	if s.cfg.DryRun {
 		return nil
 	}
@@ -383,11 +383,11 @@ func (s *Syncer) copyDestinationFile(ctx context.Context, srcPath, destPath stri
 		return nil
 	}
 
-	action := "update file"
+	action := "Updating File"
 	if _, err := os.Stat(destPath); errors.Is(err, os.ErrNotExist) {
-		action = "create file"
+		action = "Creating File"
 	}
-	s.logAction(action, "source", srcPath, "destination", destPath)
+	s.logAction("%s: %s -> %s", action, srcPath, destPath)
 
 	if s.cfg.DryRun {
 		return nil
@@ -414,7 +414,7 @@ func (s *Syncer) retryOperation(ctx context.Context, desc string, op func() erro
 		}
 
 		sleepTime := time.Duration(1<<i) * time.Second
-		s.logger.Warn("Operation failed; retrying", "operation", desc, "attempt", i+1, "max_attempts", s.cfg.MaxRetries, "error", err, "retry_in", sleepTime)
+		s.logger.Printf("Warning: Failed to %s (attempt %d/%d): %v. Retrying in %s...", desc, i+1, s.cfg.MaxRetries, err, sleepTime)
 
 		timer := time.NewTimer(sleepTime)
 		select {
@@ -493,7 +493,7 @@ func (s *Syncer) copyFileAtomic(src, dst string) error {
 
 func (s *Syncer) handleSourceEvent(ctx context.Context, event fsnotify.Event) {
 	if err := s.ValidateSyncRoots(); err != nil {
-		s.logger.Warn("Skipping event because sync roots are invalid", "path", event.Name, "error", err)
+		s.logger.Printf("Warning: Skipping event for %s because sync roots are invalid: %v", event.Name, err)
 		return
 	}
 
@@ -506,24 +506,24 @@ func (s *Syncer) handleSourceEvent(ctx context.Context, event fsnotify.Event) {
 	if event.Op&(fsnotify.Create|fsnotify.Rename) != 0 {
 		if info, err := os.Stat(event.Name); err == nil && info.IsDir() {
 			if err := s.syncSourceSubtree(ctx, event.Name); err != nil {
-				s.logger.Error("Failed to sync directory subtree", "path", event.Name, "error", err)
+				s.logger.Printf("Error syncing directory subtree %s: %v", event.Name, err)
 			}
 			return
 		}
 	}
 
 	if err := s.performSyncAction(ctx, event.Name); err != nil {
-		s.logger.Error("Failed to sync path", "path", event.Name, "error", err)
+		s.logger.Printf("Error syncing %s: %v", event.Name, err)
 	}
 }
 
 func (s *Syncer) runReconcile(ctx context.Context) {
 	if err := s.ValidateSyncRoots(); err != nil {
-		s.logger.Warn("Skipping sync because sync roots are invalid", "error", err)
+		s.logger.Printf("Warning: Skipping sync because sync roots are invalid: %v", err)
 		return
 	}
 	if err := s.Reconcile(ctx); err != nil {
-		s.logger.Error("Mirror reconciliation failed", "error", err)
+		s.logger.Printf("Error during mirror reconciliation: %v", err)
 	}
 }
 
@@ -759,20 +759,15 @@ func (s *Syncer) closeBestEffort(file *os.File, path string) {
 	}
 }
 
-func (s *Syncer) bestEffort(operation, path string, err error) {
-	if err == nil {
-		return
-	}
-	attrs := []any{"operation", operation, "error", err}
-	if path != "" {
-		attrs = append(attrs, "path", path)
-	}
-	s.logger.Debug("Best-effort operation failed", attrs...)
+func (s *Syncer) bestEffort(_, _ string, _ error) {
+	// Best-effort filesystem cleanup and metadata operations intentionally do
+	// not emit normal logs; many filesystems reject some of them harmlessly.
 }
 
-func (s *Syncer) logAction(action string, attrs ...any) {
+func (s *Syncer) logAction(format string, args ...any) {
+	message := fmt.Sprintf(format, args...)
 	if s.cfg.DryRun {
-		attrs = append(attrs, "dry_run", true)
+		message = "[DRY-RUN] " + message
 	}
-	s.logger.Info(action, attrs...)
+	s.logger.Print(message)
 }

@@ -6,7 +6,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"log/slog"
+	"log"
 	"os"
 	"os/signal"
 	"strings"
@@ -37,9 +37,7 @@ func (i *stringArray) Set(value string) error {
 }
 
 func main() {
-	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
-		Level: slog.LevelInfo,
-	}))
+	logger := log.New(os.Stdout, "", 0)
 
 	var ignoredPaths stringArray
 	cfg := syncer.Config{
@@ -59,7 +57,7 @@ func main() {
 
 	mirror, err := syncer.New(cfg)
 	if err != nil {
-		logger.Error("Invalid configuration", "error", err)
+		logger.Printf("Invalid configuration: %v", err)
 		os.Exit(1)
 	}
 
@@ -67,7 +65,7 @@ func main() {
 	defer stop()
 
 	if err := mirror.Run(ctx); err != nil {
-		logger.Error("Service stopped with error", "error", err)
+		logger.Printf("Service stopped with error: %v", err)
 		os.Exit(1)
 	}
 }

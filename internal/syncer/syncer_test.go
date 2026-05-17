@@ -3,7 +3,7 @@ package syncer
 import (
 	"context"
 	"io"
-	"log/slog"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -138,7 +138,7 @@ func newTestSyncer(t *testing.T, source, dest string, ignored []string) *Syncer 
 		ResyncInterval:   0,
 		DebounceInterval: 10,
 		MaxRetries:       1,
-		Logger:           slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Logger:           log.New(io.Discard, "", 0),
 	})
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
