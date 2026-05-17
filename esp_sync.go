@@ -1,7 +1,7 @@
 package main
 
 import (
-	"crypto/md5"
+	"bytes"
 	"flag"
 	"fmt"
 	"io"
@@ -16,14 +16,12 @@ import (
 	"github.com/fsnotify/fsnotify"
 )
 
-// --- Configuration Constants ---
-
 const (
-	debounceInterval = 500 * time.Millisecond // Time to wait for more events before syncing
-	maxRetries       = 5                      // Number of times to retry a failed file operation
+	debounceInterval = 500 * time.Millisecond
+	maxRetries       = 5
+	msdosSuperMagic  = 0x4d44 // Linux statfs magic for FAT/vfat/msdos filesystems.
+	tempFilePrefix   = ".esp-sync-"
 )
-
-// --- Custom Flag Type for String Array ---
 
 type stringArray []string
 
@@ -32,25 +30,26 @@ func (i *stringArray) String() string {
 }
 
 func (i *stringArray) Set(value string) error {
-	if value != "" {
-		for _, part := range strings.Split(value, ",") {
-			*i = append(*i, strings.TrimSpace(part))
+	if value == "" {
+		return nil
+	}
+	for _, part := range strings.Split(value, ",") {
+		part = strings.TrimSpace(part)
+		if part != "" {
+			*i = append(*i, part)
 		}
 	}
 	return nil
 }
 
-// --- Global Variables ---
-
 var (
-	SOURCE_DIR  string
-	DEST_DIR    string
-	dryRun      bool
-	ignoredDirs stringArray
-	watcher     *fsnotify.Watcher
+	SOURCE_DIR     string
+	DEST_DIR       string
+	dryRun         bool
+	resyncInterval time.Duration
+	ignoredDirs    stringArray
+	watcher        *fsnotify.Watcher
 )
-
-// --- Logging Helper ---
 
 func dryRunLog(format string, v ...interface{}) {
 	if dryRun {
@@ -59,8 +58,6 @@ func dryRunLog(format string, v ...interface{}) {
 		log.Printf(format, v...)
 	}
 }
-
-// --- Path Helpers ---
 
 func getDestPath(srcPath string) (string, error) {
 	relPath, err := filepath.Rel(SOURCE_DIR, srcPath)
@@ -83,59 +80,62 @@ func isPathIgnored(path string) bool {
 	return false
 }
 
-// --- Checksum & Verification Logic ---
-
-// calculateMD5 computes the MD5 hash of a file.
-func calculateMD5(filePath string) (string, error) {
-	file, err := os.Open(filePath)
+func pathContains(parent, child string) bool {
+	relPath, err := filepath.Rel(parent, child)
 	if err != nil {
-		return "", err
+		return false
 	}
-	defer file.Close()
-
-	hash := md5.New()
-	if _, err := io.Copy(hash, file); err != nil {
-		return "", err
-	}
-	return fmt.Sprintf("%x", hash.Sum(nil)), nil
+	return relPath != "." && relPath != ".." && !strings.HasPrefix(relPath, ".."+string(filepath.Separator))
 }
 
-// areFilesIdenticalRobust checks if files are identical using Size and MD5 Checksum.
-// This is safer than ModTime for FAT32.
+// areFilesIdenticalRobust compares file contents after a size check.
+// FAT32 mtimes and Unix mode bits are not reliable enough for correctness.
 func areFilesIdenticalRobust(srcPath, destPath string) bool {
 	srcInfo, err := os.Stat(srcPath)
 	if err != nil {
 		return false
 	}
 	destInfo, err := os.Stat(destPath)
-	if os.IsNotExist(err) {
-		return false
-	}
 	if err != nil {
 		return false
 	}
-
-	// 1. Fast Check: Size
+	if srcInfo.IsDir() || destInfo.IsDir() {
+		return false
+	}
 	if srcInfo.Size() != destInfo.Size() {
 		return false
 	}
 
-	// 2. Robust Check: Content Hash
-	srcHash, err := calculateMD5(srcPath)
-	if err != nil {
-		return false // Assume different on error
-	}
-	destHash, err := calculateMD5(destPath)
+	srcFile, err := os.Open(srcPath)
 	if err != nil {
 		return false
 	}
+	defer srcFile.Close()
 
-	return srcHash == destHash
+	destFile, err := os.Open(destPath)
+	if err != nil {
+		return false
+	}
+	defer destFile.Close()
+
+	srcBuf := make([]byte, 128*1024)
+	destBuf := make([]byte, 128*1024)
+
+	for {
+		srcN, srcErr := io.ReadFull(srcFile, srcBuf)
+		destN, destErr := io.ReadFull(destFile, destBuf)
+		if srcN != destN || !bytes.Equal(srcBuf[:srcN], destBuf[:destN]) {
+			return false
+		}
+		if srcErr == io.EOF || srcErr == io.ErrUnexpectedEOF {
+			return destErr == io.EOF || destErr == io.ErrUnexpectedEOF
+		}
+		if srcErr != nil || destErr != nil {
+			return false
+		}
+	}
 }
 
-// --- Atomic File Operations with Retry ---
-
-// retryOperation retries a function with exponential backoff.
 func retryOperation(desc string, op func() error) error {
 	var err error
 	for i := 0; i < maxRetries; i++ {
@@ -145,7 +145,7 @@ func retryOperation(desc string, op func() error) error {
 		if dryRun {
 			return nil
 		}
-		
+
 		sleepTime := time.Duration(1<<i) * time.Second
 		log.Printf("Warning: Failed to %s (attempt %d/%d): %v. Retrying in %s...", desc, i+1, maxRetries, err, sleepTime)
 		time.Sleep(sleepTime)
@@ -153,7 +153,31 @@ func retryOperation(desc string, op func() error) error {
 	return fmt.Errorf("failed after %d attempts: %w", maxRetries, err)
 }
 
-// copyFileAtomic copies content to a temp file then renames it to overwrite the target.
+func ensureDirectory(path string, mode os.FileMode) error {
+	info, err := os.Stat(path)
+	if err == nil {
+		if info.IsDir() {
+			return nil
+		}
+		if err := os.RemoveAll(path); err != nil {
+			return err
+		}
+	}
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return os.MkdirAll(path, mode)
+}
+
+func syncDirBestEffort(path string) {
+	dir, err := os.Open(path)
+	if err != nil {
+		return
+	}
+	defer dir.Close()
+	_ = dir.Sync()
+}
+
 func copyFileAtomic(src, dst string) error {
 	in, err := os.Open(src)
 	if err != nil {
@@ -161,123 +185,132 @@ func copyFileAtomic(src, dst string) error {
 	}
 	defer in.Close()
 
-	// Ensure destination directory exists
-	if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
+	destDir := filepath.Dir(dst)
+	if err := ensureDirectory(destDir, 0755); err != nil {
 		return err
 	}
 
-	// Create temp file in the SAME directory as dst to ensure atomic rename works
-	tmpDst := dst + ".tmp"
-	out, err := os.Create(tmpDst)
+	out, err := os.CreateTemp(destDir, tempFilePrefix+filepath.Base(dst)+".*.tmp")
 	if err != nil {
 		return err
 	}
-	
-	// Copy data
-	_, err = io.Copy(out, in)
-	if err != nil {
+	tmpDst := out.Name()
+	cleanupTemp := true
+	defer func() {
+		if cleanupTemp {
+			_ = os.Remove(tmpDst)
+		}
+	}()
+
+	if _, err = io.Copy(out, in); err != nil {
 		out.Close()
 		return err
 	}
-
-	// Force write to disk
 	if err = out.Sync(); err != nil {
 		out.Close()
 		return err
 	}
-	
-	// Close before rename
 	if err = out.Close(); err != nil {
 		return err
 	}
 
-	// Atomic Rename
+	if dstInfo, err := os.Stat(dst); err == nil && dstInfo.IsDir() {
+		if err := os.RemoveAll(dst); err != nil {
+			return err
+		}
+	}
 	if err := os.Rename(tmpDst, dst); err != nil {
 		return err
 	}
+	cleanupTemp = false
 
-	// Attempt to preserve metadata (best effort)
-	srcInfo, _ := os.Stat(src)
-	if srcInfo != nil {
-		os.Chmod(dst, srcInfo.Mode())
-		os.Chtimes(dst, time.Now(), srcInfo.ModTime())
+	if srcInfo, err := os.Stat(src); err == nil {
+		_ = os.Chtimes(dst, srcInfo.ModTime(), srcInfo.ModTime())
 	}
-
+	syncDirBestEffort(destDir)
 	return nil
 }
 
-// performSyncAction handles the logic for a single path: decides to Copy, Delete, or Mkdir
-// based on the current state of the source.
-func performSyncAction(srcPath string) {
-	// 1. Check Ignore
-	if isPathIgnored(srcPath) {
+func cleanupTempFilesFor(destPath string) {
+	destDir := filepath.Dir(destPath)
+	basePrefix := tempFilePrefix + filepath.Base(destPath) + "."
+	entries, err := os.ReadDir(destDir)
+	if err != nil {
 		return
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		if strings.HasPrefix(name, basePrefix) && strings.HasSuffix(name, ".tmp") {
+			_ = os.Remove(filepath.Join(destDir, name))
+		}
+	}
+}
+
+func performSyncAction(srcPath string) error {
+	if isPathIgnored(srcPath) {
+		return nil
 	}
 
 	destPath, err := getDestPath(srcPath)
 	if err != nil {
-		log.Printf("Error calculating destination for %s: %v", srcPath, err)
-		return
+		return fmt.Errorf("calculating destination for %s: %w", srcPath, err)
 	}
 
-	// 2. Check Source State
 	srcInfo, err := os.Stat(srcPath)
-
-	// CASE A: Source Does Not Exist -> Delete Destination
 	if os.IsNotExist(err) {
-		// Check for the file OR a leftover temp file
 		_, dstErr := os.Stat(destPath)
-		_, tmpErr := os.Stat(destPath + ".tmp")
-		
-		exists := !os.IsNotExist(dstErr) || !os.IsNotExist(tmpErr)
-
-		if exists {
+		if !os.IsNotExist(dstErr) {
 			dryRunLog("Deleting: %s", destPath)
 			if !dryRun {
 				err := retryOperation("remove "+destPath, func() error {
-					// Remove main file
-					e1 := os.RemoveAll(destPath)
-					// Clean up potential temp file from interrupted atomic copy
-					e2 := os.RemoveAll(destPath + ".tmp")
-					if e1 != nil { return e1 }
-					return e2
+					return os.RemoveAll(destPath)
 				})
 				if err != nil {
-					log.Printf("Error removing %s: %v", destPath, err)
+					return fmt.Errorf("removing %s: %w", destPath, err)
 				}
+				syncDirBestEffort(filepath.Dir(destPath))
 			}
 		}
-		return
+		if !dryRun {
+			cleanupTempFilesFor(destPath)
+		}
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("stating source %s: %w", srcPath, err)
 	}
 
-	// CASE B: Source is Directory -> Ensure Dest Dir Exists & Watch
 	if srcInfo.IsDir() {
-		// Check if directory already exists to avoid verbose logging
 		if stat, err := os.Stat(destPath); err == nil && stat.IsDir() {
 			if !dryRun && watcher != nil {
-				addWatcherRecursively(watcher, srcPath)
+				if err := addWatcherRecursively(watcher, srcPath); err != nil {
+					log.Printf("Warning: Could not watch %s: %v", srcPath, err)
+				}
 			}
-			return
+			return nil
 		}
 
 		dryRunLog("Creating Directory: %s", destPath)
 		if !dryRun {
 			err := retryOperation("mkdir "+destPath, func() error {
-				return os.MkdirAll(destPath, srcInfo.Mode())
+				return ensureDirectory(destPath, 0755)
 			})
 			if err != nil {
-				log.Printf("Error creating directory %s: %v", destPath, err)
+				return fmt.Errorf("creating directory %s: %w", destPath, err)
 			}
+			_ = os.Chtimes(destPath, srcInfo.ModTime(), srcInfo.ModTime())
+			syncDirBestEffort(filepath.Dir(destPath))
 			if watcher != nil {
-				addWatcherRecursively(watcher, srcPath)
+				if err := addWatcherRecursively(watcher, srcPath); err != nil {
+					log.Printf("Warning: Could not watch %s: %v", srcPath, err)
+				}
 			}
 		}
-		return
+		return nil
 	}
 
-	// CASE C: Source is File -> Copy Atomic
 	if areFilesIdenticalRobust(srcPath, destPath) {
-		return // Skip
+		return nil
 	}
 
 	action := "Updating File"
@@ -291,77 +324,119 @@ func performSyncAction(srcPath string) {
 			return copyFileAtomic(srcPath, destPath)
 		})
 		if err != nil {
-			log.Printf("Error copying %s: %v", srcPath, err)
+			return fmt.Errorf("copying %s: %w", srcPath, err)
 		}
 	}
+	return nil
 }
 
-// --- Initial Sync ---
-
-func initialSync(source, destination string) {
-	log.Printf("Starting initial sync (mirror) from %s to %s...", source, destination)
-
-	if !dryRun {
-		os.MkdirAll(destination, 0755)
-	}
-
-	// 1. Walk Source: Copy/Update
-	filepath.Walk(source, func(path string, info os.FileInfo, err error) error {
-		if err != nil { return nil }
-		if isPathIgnored(path) {
-			if info.IsDir() { return filepath.SkipDir }
+func syncSourceSubtree(path string) error {
+	return filepath.Walk(path, func(walkPath string, info os.FileInfo, err error) error {
+		if err != nil {
 			return nil
 		}
-		if path == source { return nil }
-
-		performSyncAction(path)
-		return nil
+		if isPathIgnored(walkPath) {
+			if info.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		return performSyncAction(walkPath)
 	})
+}
 
-	// 2. Walk Destination: Delete extras
-	filepath.Walk(destination, func(path string, info os.FileInfo, err error) error {
-		if err != nil { return nil }
-		if path == destination { return nil }
+func reconcileMirror(source, destination string) error {
+	log.Printf("Starting mirror reconciliation from %s to %s...", source, destination)
+
+	if !dryRun {
+		if err := os.MkdirAll(destination, 0755); err != nil {
+			return err
+		}
+	}
+
+	err := filepath.Walk(source, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil
+		}
+		if isPathIgnored(path) {
+			if info.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if path == source {
+			return nil
+		}
+		return performSyncAction(path)
+	})
+	if err != nil {
+		return err
+	}
+
+	err = filepath.Walk(destination, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil
+		}
+		if path == destination {
+			return nil
+		}
 
 		relPath, _ := filepath.Rel(destination, path)
 		sourcePath := filepath.Join(source, relPath)
 
 		if isPathIgnored(sourcePath) {
-			if info.IsDir() { return filepath.SkipDir }
+			if info.IsDir() {
+				return filepath.SkipDir
+			}
 			return nil
 		}
 
 		if _, err := os.Stat(sourcePath); os.IsNotExist(err) {
-			performSyncAction(sourcePath) 
-			if info.IsDir() { return filepath.SkipDir }
+			if err := performSyncAction(sourcePath); err != nil {
+				return err
+			}
+			if info.IsDir() {
+				return filepath.SkipDir
+			}
 		}
 		return nil
 	})
+	if err != nil {
+		return err
+	}
 
-	log.Println("Initial sync complete.")
+	log.Println("Mirror reconciliation complete.")
+	return nil
 }
-
-// --- Watcher Helpers ---
 
 func addWatcherRecursively(watcher *fsnotify.Watcher, path string) error {
 	return filepath.Walk(path, func(walkPath string, info os.FileInfo, err error) error {
-		if err != nil { return err }
+		if err != nil {
+			return err
+		}
 		if isPathIgnored(walkPath) {
-			if info.IsDir() { return filepath.SkipDir }
+			if info.IsDir() {
+				return filepath.SkipDir
+			}
 			return nil
 		}
 		if info.IsDir() {
-			watcher.Add(walkPath)
+			if err := watcher.Add(walkPath); err != nil {
+				return err
+			}
 		}
 		return nil
 	})
 }
 
-// --- Mount Point Check ---
 func isMountPoint(path string) (bool, error) {
 	absPath, err := filepath.Abs(path)
-	if err != nil { return false, err }
-	if absPath == "/" { return true, nil }
+	if err != nil {
+		return false, err
+	}
+	if absPath == "/" {
+		return true, nil
+	}
 
 	var stat, parentStat syscall.Stat_t
 	if err := syscall.Stat(absPath, &stat); err != nil {
@@ -373,35 +448,149 @@ func isMountPoint(path string) (bool, error) {
 	return stat.Dev != parentStat.Dev, nil
 }
 
+func isFAT32(path string) (bool, error) {
+	var stat syscall.Statfs_t
+	if err := syscall.Statfs(path, &stat); err != nil {
+		return false, err
+	}
+	return uint64(stat.Type) == msdosSuperMagic, nil
+}
+
+func validateRootLayout() error {
+	sourceAbs, err := filepath.Abs(SOURCE_DIR)
+	if err != nil {
+		return err
+	}
+	destAbs, err := filepath.Abs(DEST_DIR)
+	if err != nil {
+		return err
+	}
+	sourceAbs = filepath.Clean(sourceAbs)
+	destAbs = filepath.Clean(destAbs)
+
+	if sourceAbs == destAbs {
+		return fmt.Errorf("source and destination are the same path: %s", sourceAbs)
+	}
+	if pathContains(sourceAbs, destAbs) {
+		return fmt.Errorf("destination %s is inside source %s", destAbs, sourceAbs)
+	}
+	if pathContains(destAbs, sourceAbs) {
+		return fmt.Errorf("source %s is inside destination %s", sourceAbs, destAbs)
+	}
+
+	var sourceStat, destStat syscall.Stat_t
+	if err := syscall.Stat(sourceAbs, &sourceStat); err != nil {
+		return fmt.Errorf("stat failed for source %s: %w", sourceAbs, err)
+	}
+	if err := syscall.Stat(destAbs, &destStat); err != nil {
+		return fmt.Errorf("stat failed for destination %s: %w", destAbs, err)
+	}
+	if sourceStat.Dev == destStat.Dev {
+		return fmt.Errorf("source and destination are on the same filesystem device")
+	}
+	return nil
+}
+
+func validateRoot(path, name string) error {
+	ok, err := isMountPoint(path)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("%s %s is not a mount point", name, path)
+	}
+	ok, err = isFAT32(path)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("%s %s is not a FAT32/vfat filesystem", name, path)
+	}
+	return nil
+}
+
+func validateSyncRoots() error {
+	if err := validateRootLayout(); err != nil {
+		return err
+	}
+	if err := validateRoot(SOURCE_DIR, "source"); err != nil {
+		return err
+	}
+	if err := validateRoot(DEST_DIR, "destination"); err != nil {
+		return err
+	}
+	return nil
+}
+
+func runReconcile() {
+	if err := validateSyncRoots(); err != nil {
+		log.Printf("Skipping sync: %v", err)
+		return
+	}
+	if err := reconcileMirror(SOURCE_DIR, DEST_DIR); err != nil {
+		log.Printf("Error during mirror reconciliation: %v", err)
+	}
+}
+
+func handleSourceEvent(event fsnotify.Event) {
+	if err := validateSyncRoots(); err != nil {
+		log.Printf("Skipping event for %s: %v", event.Name, err)
+		return
+	}
+
+	if event.Op&(fsnotify.Remove|fsnotify.Rename) != 0 && watcher != nil {
+		_ = watcher.Remove(event.Name)
+	}
+
+	if event.Op&(fsnotify.Create|fsnotify.Rename) != 0 {
+		if info, err := os.Stat(event.Name); err == nil && info.IsDir() {
+			if err := syncSourceSubtree(event.Name); err != nil {
+				log.Printf("Error syncing directory subtree %s: %v", event.Name, err)
+			}
+			return
+		}
+	}
+
+	if err := performSyncAction(event.Name); err != nil {
+		log.Printf("Error syncing %s: %v", event.Name, err)
+	}
+}
+
 func main() {
 	log.SetFlags(0)
-	log.SetOutput(os.Stdout) // Force logs to write to stdout instead of stderr
+	log.SetOutput(os.Stdout)
 
 	flag.StringVar(&SOURCE_DIR, "source", "/tmp/efi_source", "Source directory")
 	flag.StringVar(&DEST_DIR, "dest", "/tmp/efi_dest", "Destination directory")
 	flag.BoolVar(&dryRun, "dry-run", false, "Log actions only")
+	flag.DurationVar(&resyncInterval, "resync-interval", 5*time.Minute, "Periodic full reconciliation interval; 0 disables")
 	flag.Var(&ignoredDirs, "ignore", "Subdirectories to ignore")
 	flag.Parse()
 
-	SOURCE_DIR = filepath.Clean(SOURCE_DIR)
-	DEST_DIR = filepath.Clean(DEST_DIR)
-	
+	var err error
+	SOURCE_DIR, err = filepath.Abs(filepath.Clean(SOURCE_DIR))
+	if err != nil {
+		log.Fatal(err)
+	}
+	DEST_DIR, err = filepath.Abs(filepath.Clean(DEST_DIR))
+	if err != nil {
+		log.Fatal(err)
+	}
+
 	for i, dir := range ignoredDirs {
 		ignoredDirs[i] = filepath.Clean(filepath.Join(SOURCE_DIR, dir))
 	}
 
-	log.Println("Validating mount points...")
-	if ok, _ := isMountPoint(SOURCE_DIR); !ok {
-		log.Fatalf("FATAL: Source %s is not a mount point.", SOURCE_DIR)
-	}
-	if ok, _ := isMountPoint(DEST_DIR); !ok {
-		log.Fatalf("FATAL: Destination %s is not a mount point.", DEST_DIR)
+	log.Println("Validating sync roots...")
+	if err := validateSyncRoots(); err != nil {
+		log.Fatalf("FATAL: %v.", err)
 	}
 	log.Println("Validation successful.")
 
-	initialSync(SOURCE_DIR, DEST_DIR)
+	if err := reconcileMirror(SOURCE_DIR, DEST_DIR); err != nil {
+		log.Fatal(err)
+	}
 
-	var err error
 	watcher, err = fsnotify.NewWatcher()
 	if err != nil {
 		log.Fatal(err)
@@ -413,10 +602,25 @@ func main() {
 	}
 
 	log.Printf("Service started. Watching %s...", SOURCE_DIR)
+	if resyncInterval > 0 {
+		log.Printf("Periodic reconciliation enabled every %s.", resyncInterval)
+	} else {
+		log.Println("Periodic reconciliation disabled.")
+	}
 
-	pendingEvents := make(map[string]time.Time)
+	pendingEvents := make(map[string]fsnotify.Event)
+	pendingTimes := make(map[string]time.Time)
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
+
+	var resyncTicker *time.Ticker
+	var resyncChan <-chan time.Time
+	if resyncInterval > 0 {
+		resyncTicker = time.NewTicker(resyncInterval)
+		defer resyncTicker.Stop()
+		resyncChan = resyncTicker.C
+	}
+
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
@@ -428,7 +632,11 @@ func main() {
 				done = true
 				break
 			}
-			pendingEvents[event.Name] = time.Now().Add(debounceInterval)
+			if existing, ok := pendingEvents[event.Name]; ok {
+				event.Op |= existing.Op
+			}
+			pendingEvents[event.Name] = event
+			pendingTimes[event.Name] = time.Now().Add(debounceInterval)
 
 		case err, ok := <-watcher.Errors:
 			if !ok {
@@ -439,17 +647,17 @@ func main() {
 
 		case <-ticker.C:
 			now := time.Now()
-			for path, execTime := range pendingEvents {
+			for path, execTime := range pendingTimes {
 				if now.After(execTime) {
+					event := pendingEvents[path]
 					delete(pendingEvents, path)
-					
-					// IMPORTANT CHANGE: Run synchronously to avoid race conditions 
-					// between creating/copying a file and immediately deleting it.
-					// On slow USB media, atomic copy+flush+rename can be slow.
-					// Running synchronously ensures the file exists before we check if it needs deletion.
-					performSyncAction(path)
+					delete(pendingTimes, path)
+					handleSourceEvent(event)
 				}
 			}
+
+		case <-resyncChan:
+			runReconcile()
 
 		case <-sigChan:
 			log.Println("\nReceived termination signal. Stopping watcher...")
@@ -459,4 +667,3 @@ func main() {
 
 	log.Println("Shutdown complete.")
 }
-
