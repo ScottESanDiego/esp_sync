@@ -1,3 +1,6 @@
+> [!WARNING]
+> This repo has been migrated to codeberg.  Go to <https://codeberg.org/scotte/esp_sync> for the latest.
+
 # esp_sync
 
 `esp_sync` keeps one EFI System Partition clone mirrored from one authoritative
